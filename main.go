@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,23 +15,28 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // переписал github.com/pxc1984/pdfbot (C#) на go: шлёшь фотки/картинки файлами, /makepdf собирает pdf.
-// никакой базы: в очереди храним только file_id телеграма, файлы качаем в момент сборки.
-// после рестарта очереди теряются - не страшно, пользователь просто перешлёт фотки
+// очередь в postgres, но только file_id телеграма: сами файлы качаем в момент сборки
+// и стримим прямо в загрузку pdf, ни на диск, ни целиком в память ничего не ложится.
+// так 100 одновременных сборок влезают в 256 МБ (см. pdf.go)
 
 const (
-	MAX_QUEUE  = 100      // страниц в одном pdf
-	MAX_FILE   = 20 << 20 // больше getFile всё равно не отдаёт
-	MAX_BUILDS = 2        // одновременных сборок, чтобы влезть в 256 МБ
-	API        = "https://api.telegram.org"
+	MAX_QUEUE = 100      // страниц в одном pdf
+	MAX_FILE  = 20 << 20 // больше getFile всё равно не отдаёт
+	MAX_PDF   = 49 << 20 // боту можно слать документы до 50 МБ
 )
+
+// var, чтобы тесты подменяли телеграм
+var API = "https://api.telegram.org"
 
 var (
 	token   = os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -43,10 +48,9 @@ var (
 		return hex.EncodeToString(s[:16])
 	}()
 
-	mu     sync.Mutex
-	queues = map[int64][]string{}
-	builds = make(chan struct{}, MAX_BUILDS)
-	hc     = &http.Client{Timeout: 2 * time.Minute}
+	db *pgxpool.Pool
+	// все запросы в один хост, держим под 100 сборок соединения открытыми
+	hc = &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 100, IdleConnTimeout: time.Minute}}
 )
 
 func envOr(k, d string) string {
@@ -57,25 +61,56 @@ func envOr(k, d string) string {
 }
 
 type update struct {
-	Message *struct {
-		Chat  struct{ ID int64 }                    `json:"chat"`
-		From  *struct{ Username, FirstName string } `json:"from"`
-		Text  string                                `json:"text"`
-		Photo []struct {
-			FileID   string `json:"file_id"`
-			FileSize int    `json:"file_size"`
-		} `json:"photo"`
-		Document *struct {
-			FileID   string `json:"file_id"`
-			MimeType string `json:"mime_type"`
-			FileSize int    `json:"file_size"`
-		} `json:"document"`
-	} `json:"message"`
+	Message *message `json:"message"`
 }
 
+type message struct {
+	Chat  struct{ ID int64 }         `json:"chat"`
+	From  *struct{ Username string } `json:"from"`
+	Text  string                     `json:"text"`
+	Photo []struct {
+		FileID   string `json:"file_id"`
+		FileSize int64  `json:"file_size"`
+	} `json:"photo"`
+	Document *struct {
+		FileID   string `json:"file_id"`
+		MimeType string `json:"mime_type"`
+		FileSize int64  `json:"file_size"`
+	} `json:"document"`
+}
+
+const SCHEMA = `
+create table if not exists queue (
+	id bigserial primary key,
+	chat_id bigint not null,
+	file_id text not null,
+	file_size bigint not null,
+	taken timestamptz, -- не null, пока страница в сборке
+	created_at timestamptz not null default now()
+);
+create index if not exists queue_chat on queue (chat_id, id);
+-- реплика одна (Recreate), так что всё взятое в сборку до рестарта - брошено, возвращаем в очередь
+update queue set taken = null where taken is not null;`
+
 func main() {
-	if token == "" || !strings.HasPrefix(hookURL, "https://") {
-		log.Fatal("нужны TELEGRAM_BOT_TOKEN и WEBHOOK_URL (https://...)")
+	if token == "" || !strings.HasPrefix(hookURL, "https://") || os.Getenv("DATABASE_URL") == "" {
+		log.Fatal("нужны TELEGRAM_BOT_TOKEN, WEBHOOK_URL (https://...) и DATABASE_URL")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	// запросы короткие, сборки держат соединение только на время запроса
+	cfg.MaxConns = 10
+	if db, err = pgxpool.NewWithConfig(ctx, cfg); err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctx, SCHEMA); err != nil {
+		log.Fatal("схема: ", err)
 	}
 
 	http.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
@@ -91,7 +126,7 @@ func main() {
 		}
 		// отвечаем сразу, иначе телеграм ретраит апдейт пока мы собираем pdf
 		if u.Message != nil {
-			go handle(&u)
+			go handle(ctx, &u)
 		}
 	})
 
@@ -102,26 +137,24 @@ func main() {
 		}
 	}()
 
-	err := call("setWebhook", url.Values{
+	err = call(ctx, "setWebhook", url.Values{
 		"url":             {hookURL},
 		"secret_token":    {hookSecret},
 		"allowed_updates": {`["message"]`},
-		"max_connections": {"10"},
+		"max_connections": {"100"},
 	}, nil)
 	if err != nil {
 		log.Fatal("setWebhook: ", err)
 	}
 	log.Printf("слушаю %s, вебхук %s", addr, hookURL)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	<-ctx.Done()
 	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(sctx)
 }
 
-func handle(u *update) {
+func handle(ctx context.Context, u *update) {
 	m := u.Message
 	chat := m.Chat.ID
 	// /cmd@botname в группах
@@ -129,123 +162,214 @@ func handle(u *update) {
 
 	switch {
 	case cmd == "/start":
-		send(chat, "Привет! Я превращаю ваши фотографии в PDF-файл.\n\n"+
+		send(ctx, chat, "Привет! Я превращаю ваши фотографии в PDF-файл.\n\n"+
 			"Просто отправляйте фотографии (лучше файлами, без сжатия).\n"+
 			"После отправки:\n/makepdf - собрать все фото в PDF\n/cancel - очистить очередь")
 	case cmd == "/makepdf":
-		makePDF(chat, m.From)
-	case cmd == "/cancel":
-		mu.Lock()
-		n := len(queues[chat])
-		delete(queues, chat)
-		mu.Unlock()
-		if n == 0 {
-			send(chat, "Очередь пуста - нечего очищать.")
-			return
+		name := "user"
+		if m.From != nil {
+			name = cleanName(m.From.Username)
 		}
-		send(chat, "Всё, забыл.")
+		makePDF(ctx, chat, name+"_"+time.Now().UTC().Format("2006-01-02")+".pdf")
+	case cmd == "/cancel":
+		tag, err := db.Exec(ctx, `delete from queue where chat_id = $1 and taken is null`, chat)
+		switch {
+		case err != nil:
+			log.Print(err)
+			send(ctx, chat, "Что-то сломалось, попробуйте ещё раз.")
+		case tag.RowsAffected() == 0:
+			send(ctx, chat, "Очередь пуста - нечего очищать.")
+		default:
+			send(ctx, chat, "Всё, забыл.")
+		}
 	case len(m.Photo) > 0:
 		// последний размер самый большой
-		enqueue(chat, m.Photo[len(m.Photo)-1].FileID, "Фото")
+		p := m.Photo[len(m.Photo)-1]
+		enqueue(ctx, chat, p.FileID, p.FileSize, "Фото")
 	case m.Document != nil:
 		d := m.Document
 		if !strings.HasPrefix(d.MimeType, "image/") {
-			send(chat, "Это не картинка, такое в PDF не положу.")
+			send(ctx, chat, "Это не картинка, такое в PDF не положу.")
 			return
 		}
 		if d.FileSize > MAX_FILE {
-			send(chat, "Файл больше 20 МБ, телеграм не даст мне его скачать.")
+			send(ctx, chat, "Файл больше 20 МБ, телеграм не даст мне его скачать.")
 			return
 		}
-		enqueue(chat, d.FileID, "Документ")
+		enqueue(ctx, chat, d.FileID, d.FileSize, "Документ")
 	case m.Text != "":
-		send(chat, "Отправьте фото или документ, и я соберу из них PDF.\n\n/makepdf - собрать PDF\n/cancel - отменить")
+		send(ctx, chat, "Отправьте фото или документ, и я соберу из них PDF.\n\n/makepdf - собрать PDF\n/cancel - отменить")
 	}
 }
 
-func enqueue(chat int64, fileID, what string) {
-	mu.Lock()
-	q := queues[chat]
-	full := len(q) >= MAX_QUEUE
-	if !full {
-		q = append(q, fileID)
-		queues[chat] = q
-	}
-	mu.Unlock()
-	if full {
-		send(chat, fmt.Sprintf("В очереди уже %d страниц, больше не влезет. /makepdf или /cancel", MAX_QUEUE))
-		return
-	}
-	send(chat, fmt.Sprintf("%s добавлено! В очереди: %d.\n/makepdf - собрать в PDF\n/cancel - очистить", what, len(q)))
-}
-
-func makePDF(chat int64, from *struct{ Username, FirstName string }) {
-	mu.Lock()
-	q := queues[chat]
-	delete(queues, chat)
-	mu.Unlock()
-	if len(q) == 0 {
-		send(chat, "У вас нет сохранённых фото. Отправьте фотографии, затем /makepdf")
-		return
-	}
-	send(chat, "Собираю PDF... Подождите.")
-
-	builds <- struct{}{}
-	defer func() { <-builds }()
-
-	// pdf пишем во временный файл, а не в память: 100 страниц по паре мегабайт
-	f, err := os.CreateTemp("", "pdfbot-*.pdf")
+func enqueue(ctx context.Context, chat int64, fileID string, size int64, what string) {
+	// вставляем, только если очередь не полная; n - сколько было до вставки
+	var n, added int
+	err := db.QueryRow(ctx, `
+		with c as (select count(*) n from queue where chat_id = $1 and taken is null),
+		ins as (insert into queue (chat_id, file_id, file_size) select $1, $2, $3 from c where n < $4 returning 1)
+		select n, (select count(*) from ins) from c`, chat, fileID, size, MAX_QUEUE).Scan(&n, &added)
 	if err != nil {
 		log.Print(err)
-		send(chat, "Не получилось собрать PDF, попробуйте ещё раз.")
+		send(ctx, chat, "Не получилось сохранить, пришлите ещё раз.")
 		return
 	}
-	defer os.Remove(f.Name())
-	defer f.Close()
+	if added == 0 {
+		send(ctx, chat, fmt.Sprintf("В очереди уже %d страниц, больше не влезет. /makepdf или /cancel", MAX_QUEUE))
+		return
+	}
+	send(ctx, chat, fmt.Sprintf("%s добавлено! В очереди: %d.\n/makepdf - собрать в PDF\n/cancel - очистить", what, n+1))
+}
 
-	bw := bufio.NewWriter(f)
-	p := newPDF(bw)
-	for i, id := range q {
-		b, err := download(id)
-		if err == nil {
-			var im pdfImg
-			im, err = toJPEG(b)
-			if err == nil {
-				p.addPage(im)
+type page struct {
+	id     int64
+	fileID string
+	size   int64
+}
+
+func makePDF(ctx context.Context, chat int64, name string) {
+	// берём очередь в сборку; удаляем только после отправки, чтобы при падении не потерять
+	rows, err := db.Query(ctx, `update queue set taken = now() where chat_id = $1 and taken is null returning id, file_id, file_size`, chat)
+	var q []page
+	if err == nil {
+		for rows.Next() {
+			var p page
+			if err = rows.Scan(&p.id, &p.fileID, &p.size); err != nil {
+				break
+			}
+			q = append(q, p)
+		}
+		rows.Close()
+		err = errors.Join(err, rows.Err())
+	}
+	if err != nil {
+		log.Print(err)
+		send(ctx, chat, "Что-то сломалось, попробуйте ещё раз.")
+		return
+	}
+	if len(q) == 0 {
+		send(ctx, chat, "У вас нет сохранённых фото. Отправьте фотографии, затем /makepdf")
+		return
+	}
+	slices.SortFunc(q, func(a, b page) int { return cmp.Compare(a.id, b.id) })
+	ids := make([]int64, len(q))
+	var total int64
+	for i, p := range q {
+		ids[i] = p.id
+		total += p.size
+	}
+
+	release := func() {
+		if _, err := db.Exec(context.Background(), `update queue set taken = null where id = any($1)`, ids); err != nil {
+			log.Print(err)
+		}
+	}
+	if total > MAX_PDF {
+		release()
+		send(ctx, chat, fmt.Sprintf("Файлы весят %d МБ, а телеграм пропускает PDF только до 50 МБ. /cancel и пришлите поменьше.", total>>20))
+		return
+	}
+	send(ctx, chat, "Собираю PDF... Подождите.")
+
+	skipped, err := uploadPDF(ctx, chat, name, q)
+	for _, s := range skipped {
+		send(ctx, chat, s)
+	}
+	if err != nil {
+		release()
+		log.Printf("chat %d: %v", chat, err)
+		send(ctx, chat, "Не получилось собрать PDF. Попробуйте /makepdf ещё раз или /cancel.")
+		return
+	}
+	if _, err := db.Exec(context.Background(), `delete from queue where id = any($1)`, ids); err != nil {
+		log.Print(err)
+	}
+}
+
+var errNoPages = errors.New("ни одной страницы")
+
+// uploadPDF собирает pdf прямо в тело sendDocument: страница за страницей из ответов телеграма.
+// страницы, которые не картинки, пропускаются (их описания в skipped)
+func uploadPDF(ctx context.Context, chat int64, name string, q []page) (skipped []string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		mw.WriteField("chat_id", fmt.Sprint(chat))
+		part, err := mw.CreateFormFile("document", name)
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		p := newPDF(part)
+		for i, pg := range q {
+			if err := addFromTelegram(ctx, p, pg); err != nil {
+				if p.err != nil {
+					// pdf уже недописан, дальше смысла нет
+					pw.CloseWithError(err)
+					return
+				}
+				skipped = append(skipped, fmt.Sprintf("Страницу %d пропустил: %v", i+1, err))
 			}
 		}
-		if err != nil {
-			log.Printf("chat %d, страница %d: %v", chat, i+1, err)
-			send(chat, fmt.Sprintf("Страницу %d пропустил: %v", i+1, err))
+		if len(p.kids) == 0 {
+			pw.CloseWithError(errNoPages)
+			return
 		}
-	}
-	if len(p.kids) == 0 {
-		send(chat, "Ни одной страницы собрать не вышло.")
-		return
-	}
-	if err := p.close(); err != nil {
-		log.Print(err)
-		send(chat, "Не получилось собрать PDF, попробуйте ещё раз.")
-		return
-	}
-	if err := bw.Flush(); err != nil {
-		log.Print(err)
-		return
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		log.Print(err)
-		return
-	}
+		err = p.close()
+		if err == nil {
+			err = mw.Close()
+		}
+		pw.CloseWithError(err)
+	}()
 
-	name := "user"
-	if from != nil {
-		name = cleanName(from.Username)
+	req, _ := http.NewRequestWithContext(ctx, "POST", API+"/bot"+token+"/sendDocument", pr)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := hc.Do(req)
+	// дожидаемся писателя: после этого skipped уже не меняется
+	pr.CloseWithError(io.ErrClosedPipe)
+	cancel()
+	<-done
+	if err != nil {
+		return skipped, redact(err)
 	}
-	name += "_" + time.Now().UTC().Format("2006-01-02") + ".pdf"
-	if err := sendDocument(chat, name, f); err != nil {
-		log.Printf("sendDocument chat %d: %v", chat, err)
-		send(chat, "Не получилось отправить PDF.")
+	defer resp.Body.Close()
+	return skipped, decode(resp.Body, nil)
+}
+
+func addFromTelegram(ctx context.Context, p *pdfWriter, pg page) error {
+	var f struct {
+		FilePath string `json:"file_path"`
+		FileSize int64  `json:"file_size"`
 	}
+	if err := call(ctx, "getFile", url.Values{"file_id": {pg.fileID}}, &f); err != nil {
+		return err
+	}
+	req, _ := http.NewRequestWithContext(ctx, "GET", API+"/file/bot"+token+"/"+f.FilePath, nil)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return errors.New("не скачалось")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("скачивание: HTTP %d", resp.StatusCode)
+	}
+	size := resp.ContentLength
+	if size < 0 {
+		size = f.FileSize
+	}
+	if size <= 0 || size > MAX_FILE {
+		return fmt.Errorf("непонятный размер файла %d", size)
+	}
+	im, err := prepare(resp.Body, size)
+	if err != nil {
+		return err
+	}
+	return p.addPage(im)
 }
 
 // cleanName: как SanitizeFileName в оригинале - буквы, цифры, пробел и дефис, до 64 символов
@@ -262,16 +386,27 @@ func cleanName(s string) string {
 	return string(r[:min(len(r), 64)])
 }
 
-// --- Bot API руками, библиотека ради пяти методов не нужна ---
+// --- Bot API руками, библиотека ради четырёх методов не нужна ---
 
-func call(method string, v url.Values, out any) error {
-	resp, err := hc.PostForm(API+"/bot"+token+"/"+method, v)
+func call(ctx context.Context, method string, v url.Values, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", API+"/bot"+token+"/"+method, strings.NewReader(v.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := hc.Do(req)
 	if err != nil {
-		// в ошибке url с токеном, не светим его в логах
-		return errors.New(strings.ReplaceAll(err.Error(), token, "***"))
+		return redact(err)
 	}
 	defer resp.Body.Close()
 	return decode(resp.Body, out)
+}
+
+// в ошибках http url с токеном, не светим его в логах
+func redact(err error) error {
+	if token == "" {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), token, "***"))
 }
 
 func decode(r io.Reader, out any) error {
@@ -280,7 +415,7 @@ func decode(r io.Reader, out any) error {
 		Description string          `json:"description"`
 		Result      json.RawMessage `json:"result"`
 	}
-	if err := json.NewDecoder(r).Decode(&res); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r, 1<<20)).Decode(&res); err != nil {
 		return err
 	}
 	if !res.OK {
@@ -292,51 +427,8 @@ func decode(r io.Reader, out any) error {
 	return json.Unmarshal(res.Result, out)
 }
 
-func send(chat int64, text string) {
-	err := call("sendMessage", url.Values{"chat_id": {fmt.Sprint(chat)}, "text": {text}}, nil)
-	if err != nil {
+func send(ctx context.Context, chat int64, text string) {
+	if err := call(ctx, "sendMessage", url.Values{"chat_id": {fmt.Sprint(chat)}, "text": {text}}, nil); err != nil {
 		log.Printf("sendMessage chat %d: %v", chat, err)
 	}
-}
-
-func download(fileID string) ([]byte, error) {
-	var f struct {
-		FilePath string `json:"file_path"`
-	}
-	if err := call("getFile", url.Values{"file_id": {fileID}}, &f); err != nil {
-		return nil, err
-	}
-	resp, err := hc.Get(API + "/file/bot" + token + "/" + f.FilePath)
-	if err != nil {
-		return nil, errors.New("не скачалось")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("скачивание: HTTP %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, MAX_FILE+1))
-}
-
-// sendDocument стримит файл через pipe, целиком в память не читаем
-func sendDocument(chat int64, name string, r io.Reader) error {
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-	go func() {
-		mw.WriteField("chat_id", fmt.Sprint(chat))
-		part, err := mw.CreateFormFile("document", name)
-		if err == nil {
-			_, err = io.Copy(part, r)
-		}
-		if err == nil {
-			err = mw.Close()
-		}
-		pw.CloseWithError(err)
-	}()
-	resp, err := hc.Post(API+"/bot"+token+"/sendDocument", mw.FormDataContentType(), pr)
-	if err != nil {
-		pr.CloseWithError(err)
-		return errors.New(strings.ReplaceAll(err.Error(), token, "***"))
-	}
-	defer resp.Body.Close()
-	return decode(resp.Body, nil)
 }

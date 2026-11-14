@@ -9,34 +9,60 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"io"
+	"runtime/debug"
 )
 
 // сам пишу PDF: картинки кладём как JPEG (DCTDecode), библиотека тут не нужна.
-// одна страница = одна картинка, 1 пиксель = 1 pt, вьюеры всё равно масштабируют
+// одна страница = одна картинка, 1 пиксель = 1 pt, вьюеры всё равно масштабируют.
+//
+// по памяти: JPEG (а фото из телеги всегда JPEG) не декодируем, а стримим как есть из
+// ответа телеграма прямо в pdf - на сборку уходит только буфер заголовка.
+// png/gif приходится декодировать целиком, поэтому такие страницы по одной на весь процесс
 
-// картинки больше этого не декодируем: RGBA на 25 Мп это уже 100 МБ, а лимит пода 256
-const MAX_PIXELS = 25_000_000
+const (
+	// png больше этого не декодируем: RGBA на 16 Мп это 64 МБ
+	MAX_PIXELS = 16_000_000
+	// заголовок, по которому DecodeConfig находит размер (EXIF бывает до 64 КБ)
+	MAX_HEADER = 256 << 10
+)
+
+// декодировать (не JPEG) можно только одну картинку за раз
+var decodeSem = make(chan struct{}, 1)
 
 type pdfImg struct {
 	w, h int
 	gray bool
-	jpg  []byte
+	size int64     // длина JPEG
+	body io.Reader // сам JPEG
 }
 
-// toJPEG: JPEG отдаём как есть, остальное (png, gif, cmyk-jpeg) перекодируем
-func toJPEG(b []byte) (pdfImg, error) {
-	cfg, format, err := image.DecodeConfig(bytes.NewReader(b))
+// prepare читает заголовок картинки длиной size. JPEG отдаёт потоком без декодирования,
+// остальное перекодирует в JPEG в память
+func prepare(r io.Reader, size int64) (pdfImg, error) {
+	var head bytes.Buffer
+	cfg, format, err := image.DecodeConfig(io.TeeReader(io.LimitReader(r, MAX_HEADER), &head))
 	if err != nil {
 		return pdfImg{}, fmt.Errorf("не картинка: %w", err)
 	}
-	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width*cfg.Height > MAX_PIXELS {
-		return pdfImg{}, fmt.Errorf("картинка %dx%d слишком большая", cfg.Width, cfg.Height)
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return pdfImg{}, fmt.Errorf("кривой размер %dx%d", cfg.Width, cfg.Height)
 	}
+	full := io.MultiReader(&head, r)
 	gray := cfg.ColorModel == color.GrayModel
 	if format == "jpeg" && (gray || cfg.ColorModel == color.YCbCrModel) {
-		return pdfImg{cfg.Width, cfg.Height, gray, b}, nil
+		return pdfImg{cfg.Width, cfg.Height, gray, size, full}, nil
 	}
-	m, _, err := image.Decode(bytes.NewReader(b))
+	if cfg.Width*cfg.Height > MAX_PIXELS {
+		return pdfImg{}, fmt.Errorf("%s %dx%d слишком большая, пришлите JPEG", format, cfg.Width, cfg.Height)
+	}
+
+	decodeSem <- struct{}{}
+	defer func() {
+		<-decodeSem
+		// декодированная картинка - десятки МБ, сразу отдаём их ОС, а не ждём GC
+		debug.FreeOSMemory()
+	}()
+	m, _, err := image.Decode(full)
 	if err != nil {
 		return pdfImg{}, err
 	}
@@ -46,7 +72,7 @@ func toJPEG(b []byte) (pdfImg, error) {
 	}
 	// jpeg.Encode серое пишет серым, остальное в YCbCr
 	_, isGray := m.(*image.Gray)
-	return pdfImg{cfg.Width, cfg.Height, isGray, out.Bytes()}, nil
+	return pdfImg{cfg.Width, cfg.Height, isGray, int64(out.Len()), &out}, nil
 }
 
 // pdfWriter пишет потоково: страницы добавляются по одной, в памяти только оффсеты
@@ -67,15 +93,6 @@ func (p *pdfWriter) printf(f string, a ...any) {
 	p.err = err
 }
 
-func (p *pdfWriter) write(b []byte) {
-	if p.err != nil {
-		return
-	}
-	k, err := p.w.Write(b)
-	p.n += int64(k)
-	p.err = err
-}
-
 // obj начинает объект с номером id (номера раздаём заранее, порядок записи любой)
 func (p *pdfWriter) obj(id int) {
 	for len(p.offs) < id {
@@ -92,7 +109,8 @@ func newPDF(w io.Writer) *pdfWriter {
 	return p
 }
 
-func (p *pdfWriter) addPage(im pdfImg) {
+// addPage: если тело короче/длиннее заявленного, pdf уже битый - ошибка фатальная
+func (p *pdfWriter) addPage(im pdfImg) error {
 	// page, image, contents
 	pg := len(p.offs) + 1
 	img, cnt := pg+1, pg+2
@@ -106,13 +124,21 @@ func (p *pdfWriter) addPage(im pdfImg) {
 		cs = "/DeviceGray"
 	}
 	p.obj(img)
-	p.printf("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s /BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n", im.w, im.h, cs, len(im.jpg))
-	p.write(im.jpg)
+	p.printf("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s /BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n", im.w, im.h, cs, im.size)
+	if p.err == nil {
+		k, err := io.Copy(p.w, io.LimitReader(im.body, im.size))
+		p.n += k
+		p.err = err
+		if err == nil && k != im.size {
+			p.err = fmt.Errorf("картинка %d байт вместо %d", k, im.size)
+		}
+	}
 	p.printf("\nendstream\nendobj\n")
 
 	s := fmt.Sprintf("q %d 0 0 %d 0 0 cm /Im0 Do Q", im.w, im.h)
 	p.obj(cnt)
 	p.printf("<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(s), s)
+	return p.err
 }
 
 func (p *pdfWriter) close() error {
