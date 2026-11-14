@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -103,6 +104,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// ходим через transaction-пулер PgBouncer: соседние запросы могут попасть на разные
+	// серверные соединения, поэтому без prepared statements, только simple protocol
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	// запросы короткие, сборки держат соединение только на время запроса
 	cfg.MaxConns = 10
 	if db, err = pgxpool.NewWithConfig(ctx, cfg); err != nil {

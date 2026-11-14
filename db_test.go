@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -15,8 +16,13 @@ func TestQueue(t *testing.T) {
 		t.Skip("нет PDFBOT_TEST_DB")
 	}
 	ctx := context.Background()
-	var err error
-	if db, err = pgxpool.New(ctx, dsn); err != nil {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// как в проде за PgBouncer
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	if db, err = pgxpool.NewWithConfig(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
